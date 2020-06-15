@@ -7,6 +7,45 @@
 
 #pragma comment(lib, "wbemuuid.lib")
 
+enum WMIResultCode {
+    Success,
+    InitComFailed,
+    InitSecurityFailed,
+    InitLocatorFailed
+};
+
+std::pair<WMIResultCode, HRESULT> initWMIConnection(IWbemLocator *pLoc, bool withAuthentication) {
+    HRESULT hres;
+
+    hres = CoInitializeEx(0, COINIT_MULTITHREADED);
+    if (FAILED(hres)) {
+        return std::make_pair(WMIResultCode::InitComFailed, hres);
+    }
+
+    DWORD impersonationFlag = withAuthentication ? RPC_C_IMP_LEVEL_IDENTIFY : RPC_C_IMP_LEVEL_IMPERSONATE;
+    hres = CoInitializeSecurity(
+        NULL, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_DEFAULT, impersonationFlag, NULL, EOAC_NONE, NULL
+    );
+    if (FAILED(hres)) {
+        CoUninitialize();
+
+        return std::make_pair(WMIResultCode::InitSecurityFailed, hres);
+    }
+
+    hres = CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID *) &pLoc);
+    if (FAILED(hres)) {
+        CoUninitialize();
+
+        return std::make_pair(WMIResultCode::InitLocatorFailed, hres);
+    }
+
+    return std::make_pair(WMIResultCode::Success, hres);
+}
+
+// int initWMILocalAuthentication() {
+
+// }
+
 /**
  * @doc: https://docs.microsoft.com/en-us/windows/win32/wmisdk/example--getting-wmi-data-from-the-local-computer
  * @doc: https://www.activexperts.com/admin/scripts/wmi/python/ (list of WMI tables)
@@ -14,50 +53,27 @@
 Napi::Value execQuery(const Napi::CallbackInfo &info) {
     Napi::Env env = info.Env();
     std::stringstream error;
-    HRESULT hres;
-
-    // Step 1: --------------------------------------------------
-    // Initialize COM. ------------------------------------------
-    hres =  CoInitializeEx(0, COINIT_MULTITHREADED);
-    if (FAILED(hres)) {
-        error << "Failed to initialize COM library. Error code = 0x" << std::hex << hres << std::endl;
-        Napi::Error::New(env, error.str()).ThrowAsJavaScriptException();
-
-        return env.Null();
-    }
-
-    // Step 2: --------------------------------------------------
-    // Set general COM security levels --------------------------
-    hres =  CoInitializeSecurity(
-        NULL,
-        -1,                          // COM authentication
-        NULL,                        // Authentication services
-        NULL,                        // Reserved
-        RPC_C_AUTHN_LEVEL_DEFAULT,   // Default authentication
-        RPC_C_IMP_LEVEL_IMPERSONATE, // Default Impersonation
-        NULL,                        // Authentication info
-        EOAC_NONE,                   // Additional capabilities
-        NULL                         // Reserved
-    );
-    if (FAILED(hres)) {
-        error << "Failed to initialize security. Error code = 0x" << std::hex << hres << std::endl;
-        Napi::Error::New(env, error.str()).ThrowAsJavaScriptException();
-        CoUninitialize();
-
-        return env.Null();
-    }
-
-    // Step 3: ---------------------------------------------------
-    // Obtain the initial locator to WMI -------------------------
+    HRESULT hres = NULL;
     IWbemLocator *pLoc = NULL;
-    hres = CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID *) &pLoc);
-    if (FAILED(hres)) {
-        error << "Failed to create IWbemLocator object." << " Err code = 0x" << std::hex << hres << std::endl;
+
+    auto WMIInit = initWMIConnection(pLoc, false);
+    if (WMIInit.first != WMIResultCode::Success) {
+        switch (WMIInit.first) {
+            case WMIResultCode::InitComFailed:
+                error << "Failed to initialize COM library. Error code = 0x" << std::hex << WMIInit.second << std::endl;
+                break;
+            case WMIResultCode::InitSecurityFailed:
+                error << "Failed to initialize security. Error code = 0x" << std::hex << WMIInit.second << std::endl;
+                break;
+            case WMIResultCode::InitLocatorFailed:
+                error << "Failed to create IWbemLocator object." << " Err code = 0x" << std::hex << WMIInit.second << std::endl;
+                break;
+        }
         Napi::Error::New(env, error.str()).ThrowAsJavaScriptException();
-        CoUninitialize();
 
         return env.Null();
     }
+    std::cout << "step 1" << "\n";
 
     // Step 4: -----------------------------------------------------
     // Connect to WMI through the IWbemLocator::ConnectServer method
@@ -73,6 +89,8 @@ Napi::Value execQuery(const Napi::CallbackInfo &info) {
          0,                       // Context object
          &pSvc                    // pointer to IWbemServices proxy
     );
+
+    std::cout << "test test" << std::endl;
     if (FAILED(hres)) {
         error << "Could not connect. Error code = 0x" << std::hex << hres << std::endl;
         Napi::Error::New(env, error.str()).ThrowAsJavaScriptException();
@@ -92,7 +110,7 @@ Napi::Value execQuery(const Napi::CallbackInfo &info) {
        RPC_C_AUTHZ_NONE,            // RPC_C_AUTHZ_xxx
        NULL,                        // Server principal name
        RPC_C_AUTHN_LEVEL_CALL,      // RPC_C_AUTHN_LEVEL_xxx
-       RPC_C_IMP_LEVEL_IMPERSONATE, // RPC_C_IMP_LEVEL_xxx
+       RPC_C_IMP_LEVEL_IMPERSONATE, // RPC_C_IMP_LEVEL_xxx (use RPC_C_IMP_LEVEL_IDENTIFY for auth)
        NULL,                        // client identity
        EOAC_NONE                    // proxy capabilities
     );
@@ -110,12 +128,8 @@ Napi::Value execQuery(const Napi::CallbackInfo &info) {
     // Use the IWbemServices pointer to make requests of WMI ----
     // For example, get the name of the operating system
     IEnumWbemClassObject* pEnumerator = NULL;
-    hres = pSvc->ExecQuery(
-        bstr_t("WQL"),
-        bstr_t("SELECT * FROM Win32_OperatingSystem"),
-        WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
-        NULL,
-        &pEnumerator);
+    BSTR SQLQuery = bstr_t("SELECT * FROM Win32_OperatingSystem");
+    hres = pSvc->ExecQuery(bstr_t("WQL"), SQLQuery, WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &pEnumerator);
 
     if (FAILED(hres)) {
         error << "Query for operating system name failed." << " Error code = 0x" << std::hex << hres << std::endl;
